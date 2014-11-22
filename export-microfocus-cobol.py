@@ -19,6 +19,7 @@ import datetime
 import collections
 import argparse
 from collections import OrderedDict
+import unicodedata
 
 
 # The functions zoned2num() and packed2num() are taken from Carey Evans
@@ -43,8 +44,54 @@ def packed2num(p):
         v = -v
     return v
 
+def numbin(p):
+    v = int.from_bytes(p, byteorder='big')
+    return v
 
-ENCODING = 'iso-8859-1'  # TODO: Should this be configurable? Probably.
+def decompress_data(record_data):
+    """
+    20-7F 	(most printable characters) normal ASCII meaning.
+    80-9F 	1-32 spaces respectively.
+    A0-BF 	1-32 binary zeros respectively.
+    C0-DF 	1-32 character zeros respectively.
+    E0-FF 	1-32 occurrences of the character following.
+    00-1F 	1-32 characters following are interpreted literally and passed through.
+    This is used when characters in the range 00-1F, 80-9F, A0-BF, C0-DF or E0-FF occur in the  original data.
+    (Thus, one such character is expanded to two bytes; otherwise, no penalty is incurred by the compression.)
+    """
+    temp = bytearray()
+    repeatcnt = 0
+    literalcnt = 0
+    for b in record_data:
+        if repeatcnt > 0:
+            for i in range(1, repeatcnt + 1):
+                temp.append(b)
+            repeatcnt = 0
+        elif literalcnt > 0:
+            temp.append(b)
+            literalcnt = literalcnt - 1
+        elif b >= 0x20 and b <= 0x7f:
+            temp.append(b)
+        elif b >= 0x80 and b <= 0x9f:
+            diff = b - 0x7f
+            for i in range(1, diff + 1):
+                temp.append(0x20)
+        elif b >= 0xa0 and b <= 0xbf:
+            diff = b - 0x9f
+            for i in range(1, diff + 1):
+                temp.append(0)
+        elif b >= 0xc0 and b <= 0xdf:
+            diff = b - 0xbf
+            for i in range(1, diff + 1):
+                temp.append(0x30)
+        elif b >= 0xe0:
+            repeatcnt = b - 0xdf
+        else:
+            # from 0x00 to 0x1f
+            literalcnt = b + 1
+    return bytes(temp)
+
+ENCODING = 'ascii'  # TODO: Should this be configurable? Probably.
 
 def parse_config(config_file):
     """Returns list of fields definition from a config file.
@@ -338,9 +385,11 @@ class DataFileRecord(object):
     # Reduced user data record referenced by a pointer record.
     TYPE_REDUCED_REFERENCED = 0b1000
 
-    def __init__(self, type, bytes):
+    def __init__(self, type, bytes, offset, header_bytes):
         self.type = type
         self.bytes = bytes
+        self.offset = offset
+        self.header_bytes = header_bytes
 
     @property
     def type_display(self):
@@ -423,14 +472,19 @@ def parse_record_fields(record_bytes, field_def):
             fld_data = field_bytes
             skipped = True
         elif field[0] == 'X':
-            fld_data = field_bytes.decode(ENCODING).rstrip()
+            fld_data = field_bytes.decode(ENCODING, errors='ignore')
+            fld_data = ''.join(c for c in fld_data if unicodedata.category(c) != 'Cc')
+            fld_data = fld_data.rstrip()
         elif field[0] == 'Z':
             fld_data_num = zoned2num(field_bytes)
+            fld_data = str(fld_data_num).strip()
+        elif field[0] == 'N':
+            fld_data_num = numbin(field_bytes)
             fld_data = str(fld_data_num).strip()
         elif field[0] == 'P':
             fld_data_num = packed2num(field_bytes)
             fld_data = str(fld_data_num).strip()
-            format_packed = True
+            format_packed = False
             if format_packed:
                 if fld_data_num == 0:
                     fld_data = '0.00'
@@ -486,6 +540,7 @@ class CobolDataFile(object):
     def __init__(self, fileobj):
         self.file = fileobj
         self.warnings = []
+        self.offset = 0
 
         self._read_header()
 
@@ -496,6 +551,7 @@ class CobolDataFile(object):
         is used for when we expect EOF.
         """
         data = self.file.read(num_bytes)
+        self.offset = self.offset + num_bytes
         if len(data) != num_bytes and not (no_warn and len(data) == 0):
             raise IOError(('Wanted to read {} bytes at offset {}, got only '
                            '{} before end of file').format(
@@ -505,37 +561,37 @@ class CobolDataFile(object):
     def _warn(self, msg, *a, **kw):
         self.warnings.append(msg.format(*a, **kw))
 
+    def read_data(self, obj, num_bytes, name=None, unpack=None, match=None, transform=None):
+        """Read ``num_bytes`` from file. Apply ``unpack``.
+        Apply ``transform``. Match it against ``match``. Store it in
+        ``name`` attribute of the header. In this order.
+        """
+        try:
+            data = raw_data = self.read(num_bytes)
+        except IOError as e:
+            self._warn("%s" % e)
+            return
+        if len(raw_data) != num_bytes:
+            self._warn('Wanted to read {} bytes at offset {}, got only '
+                       '{} before end of file',
+                       num_bytes, self.file.tell()-num_bytes, len(raw_data))
+        if unpack:
+            data = struct.unpack(unpack, data)[0]
+        if transform:
+            data = transform(data)
+        if match and not data in match:
+            self._warn('Got {} at offset {}, expected{modifier}: {}',
+                       raw_data, self.file.tell()-num_bytes,
+                       ", ".join(map(str, match)),
+                       modifier=' one of' if len(match)>1 else '')
+        if name:
+            if isinstance(match, dict):
+                data = match.get(data, data)
+            setattr(obj, name, data)
+        return data
+
     def _read_header(self):
         self.header = header = DataFileHeader()
-
-        def read(num_bytes, name=None, unpack=None, match=None, transform=None):
-            """Read ``num_bytes`` from file. Apply ``unpack``.
-            Apply ``transform``. Match it against ``match``. Store it in
-            ``name`` attribute of the header. In this order.
-            """
-            try:
-                data = raw_data = self.read(num_bytes)
-            except IOError as e:
-                self._warn("%s" % e)
-                return
-            if len(raw_data) != num_bytes:
-                self._warn('Wanted to read {} bytes at offset {}, got only '
-                           '{} before end of file',
-                           num_bytes, self.file.tell()-num_bytes, len(raw_data))
-            if unpack:
-                data = struct.unpack(unpack, data)[0]
-            if transform:
-                data = transform(data)
-            if match and not data in match:
-                self._warn('Got {} at offset {}, expected{modifier}: {}',
-                           raw_data, self.file.tell()-num_bytes,
-                           ", ".join(map(str, match)),
-                           modifier=' one of' if len(match)>1 else '')
-            if name:
-                if isinstance(match, dict):
-                    data = match.get(data, data)
-                setattr(header, name, data)
-            return data
 
         def parse_date(data):
             # The last two characters are defined as "CC" / "cents" in
@@ -551,64 +607,64 @@ class CobolDataFile(object):
                 return data
 
         # 0
-        read(4, 'long_records', match={
-            # These bytes have meaning, but in the end, there are
-            # only two possible versions.
+        self.read_data(header, 4, 'long_records', match={
+            # These bytes have meaning
+            b'\x33\xFE\x00\x00': False,
             b'\x30\x7E\x00\x00': False,
             b'\x30\x00\x00\x7C': True,
         })
         # 4
-        read(2, 'db_sequence_num', '>h')
+        self.read_data(header, 2, 'db_sequence_num', '>h')
         # 6
-        read(2, 'integrity_flag', '>h')
+        self.read_data(header, 2, 'integrity_flag', '>h')
         # 8
-        read(14, 'creation_date', transform=parse_date)
+        self.read_data(header, 14, 'creation_date', transform=parse_date)
         # 22, reserved
-        read(14)
+        self.read_data(header, 14)
         # 36, reserved
-        read(2, match=(b'\x00\x3e',))
+        self.read_data(header, 2, match=(b'\x00\x3e',))
         # 38, not used, set to zeros
-        read(1, match=(b'\x00',))
+        self.read_data(header, 1, match=(b'\x00',))
         # 39
-        organization = read(1, 'organization', '>b', match=(1,2,3))
+        organization = self.read_data(header, 1, 'organization', '>b', match=(1,2,3))
         # 40
-        read(1, match=(b'\x00',))
+        self.read_data(header, 1, match=(b'\x00',))
         # 41
-        read(1, 'data_compression', '>b')
+        self.read_data(header, 1, 'data_compression', '>b')
         # 42
-        read(1, match=(b'\x00',))
+        self.read_data(header, 1, match=(b'\x00',))
         # 43
-        read(1, 'index_type', '>b')
+        self.read_data(header, 1, 'index_type', '>b')
         # 44
-        read(4)
+        self.read_data(header, 4)
         # 48
-        read(1, 'recording_mode', '>b', match=(0,1))
+        self.read_data(header, 1, 'recording_mode', '>b', match=(0,1))
         # 49
-        read(5, match=(b'\x00'*5,))
+        self.read_data(header, 5, match=(b'\x00'*5,))
         # 54
-        read(4, 'max_record_length', '>i')
+        self.read_data(header, 4, 'max_record_length', '>i')
         # 58
-        read(4, 'min_record_length', '>i')
+        self.read_data(header, 4, 'min_record_length', '>i')
         if organization == DataFileHeader.ORGANIZATION_INDEXED:
             # 62, set to zero
-            read(14, match=(b'\x00'*14,))
+            self.read_data(header, 14, match=(b'\x00'*14,))
             # 76, reserved
-            read(1, match=(b'\x04',))
+            self.read_data(header, 1, match=(b'\x04',))
             # 77, set to zero
-            read(31, match=(b'\x00'*31,))
+            self.read_data(header, 31, match=(b'\x00'*31,))
         else:
             # 62, set to zero
-            read(46, match=(b'\x00'*46,))
+            self.read_data(header, 46, match=(b'\x00'*46,))
         # 108
-        read(4, 'indexed_handler_version', '>i')
+        self.read_data(header, 4, 'indexed_handler_version', '>i')
         if organization == DataFileHeader.ORGANIZATION_INDEXED:
             # 112
-            read(8, match=(b'\x00'*8,))
+            self.read_data(header, 8, match=(b'\x00'*8,))
             # 120
-            read(8, 'logical_end_offset', '>q')
+            self.read_data(header, 8, 'logical_end_offset', '>q')
         else:
             # 112
-            read(16, match=(b'\x00'*16,))
+            self.read_data(header, 16, match=(b'\x00'*16,))
 
     def validate(self):
         """Validate the header information.
@@ -617,9 +673,6 @@ class CobolDataFile(object):
             if self.header.integrity_flag != 0:
                 self._warn('Integrity flag is non-zero, this may indicate a '
                            'corrupt file!')
-            if self.header.data_compression != DataFileHeader.COMPRESSION_NONE:
-                self._warn('The file indicates it uses compression, we '
-                           'probably won\'t handle this properly.')
             # There are other combinations of organization and recording mode
             # which we also don't support, but those don't even have a header
             # in the first place.
@@ -636,8 +689,13 @@ class CobolDataFile(object):
         self.validate()
         header = self.header
 
-        self.file.seek(header.size)   # go to data
+        self.file.seek(header.size) # go to data
+        self.offset = header.size
+
+        blockcnt  = 0
+
         while True:
+            start_offset = self.offset
             # Read the record header
             header_length = 4 if header.long_records else 2
             record_header_bytes = self.read(header_length, no_warn=True)
@@ -651,6 +709,8 @@ class CobolDataFile(object):
                 record_header_bytes)[0]
             # First 4 bits are the record type
             record_type = (record_header >> (27 if header.long_records else 12))
+            if record_type < 0:
+                record_type = -record_type
             if record_type > 8 or record_type < 0:
                 self._warn('Unknown record type id in record header at '+
                            'offset {}: {}; This is probably a corrupt file.',
@@ -664,10 +724,12 @@ class CobolDataFile(object):
 
             # Get the actual record
             record_data = self.read(data_length)
+            record_data = decompress_data(record_data)
 
             # Parse the record
-            if not record_type in ignore:
-                yield DataFileRecord(record_type, record_data)
+            #if not record_type in ignore:
+            if True:
+                yield DataFileRecord(record_type, record_data, start_offset, record_header_bytes)
 
             # Read the slack bytes. The formula is:
             #    number_slack_bytes = record_length % num_alignment_bytes
@@ -675,24 +737,29 @@ class CobolDataFile(object):
             # meaning the header plus the data length as specified by the
             # header), and num_alignment_bytes being dependent on the file
             # type.
-            if header.num_alignment_bytes:
-                self.read(
-                    -(data_length + header_length) % header.num_alignment_bytes)
-
+            if record_type == 5 or record_type == 8:
+                next_data_offset = self.read(4)
+                data_offset = struct.unpack('>i', next_data_offset)[0]
+                self.read(data_offset - 4)
+            else:
+                if header.num_alignment_bytes:
+                    self.read(
+                        -(data_length + header_length) % header.num_alignment_bytes)
+            blockcnt += 1
 
 def parse_records(records_iter, field_def):
     """Records in, (record, parsed) out."""
     for record in records_iter:
         # TODO: what about pointers, references?
-        is_deleted = record.type == DataFileRecord.TYPE_DELETED
-        if not field_def is None:
-            parsed = parse_record_fields(record.bytes, field_def)
-            if parsed is not None:
-                parsed[1]['__deleted'] = is_deleted
-                yield record, parsed
-        else:
-            yield record, None
-
+        if record.type_display in ['normal', 'reduced', 'referenced', 'reduced_referenced']:
+            is_deleted = record.type == DataFileRecord.TYPE_DELETED
+            if not field_def is None:
+                parsed = parse_record_fields(record.bytes, field_def)
+                if parsed is not None:
+                    parsed[1]['__deleted'] = is_deleted
+                    yield record, parsed
+            else:
+                yield record, None
 
 def csv_exporter(records, output):
     for index, (record, data) in enumerate(records):
@@ -750,6 +817,7 @@ if __name__ == "__main__":
             sys.exit(1)
 
         for filename in args.files:
+            print('exporting: ' + filename)
             file = CobolDataFile(open(filename, 'rb'))
             exporter(parse_records(file.iter_records(), fields), sys.stdout)
 
