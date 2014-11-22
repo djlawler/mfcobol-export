@@ -20,6 +20,7 @@ import collections
 import argparse
 from collections import OrderedDict
 import unicodedata
+import csv
 
 
 # The functions zoned2num() and packed2num() are taken from Carey Evans
@@ -762,9 +763,20 @@ def parse_records(records_iter, field_def):
                 yield record, None
 
 def csv_exporter(records, output):
-    for index, (record, data) in enumerate(records):
-        as_list, as_map = data
-        output.write(",".join(as_list)+'\n')
+    fname = args.files[0]  # there will be just one filename
+    if '.' in fname:
+        fname = os.path.splitext(fname)[0]
+    fname = fname + '.csv'
+    with open(fname, 'w', newline='', encoding=ENCODING, errors='ignore') as csvfile:
+        csvwriter = csv.writer(csvfile, delimiter='|', quotechar='"', quoting=csv.QUOTE_ALL, doublequote=True)
+        colnames = []
+        for field in fields:
+            if field.key != '':
+                colnames.append(field.key)
+        csvwriter.writerow(colnames)
+        for index, (record, data) in enumerate(records):
+            as_list, as_map = data
+            csvwriter.writerow(as_list)
 
 def json_exporter(records, output):
     import json
