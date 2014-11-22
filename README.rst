@@ -1,3 +1,10 @@
+This is a modified version of miracle2k's mfcobol-export script.  The
+modifications allowed me to be able to parse Micofocus Cobol IDXFORMAT"8"
+Indexed files.  You still need to figure out the structure of the data
+in the file you are parsing...good luck with that!
+
+The original content of the file is below:
+
 This is a script to access data in a Microfocus COBOL database and export
 it. It runs on Python 3 and requires the argparse library (needs to be
 installed on Python < 3.2).

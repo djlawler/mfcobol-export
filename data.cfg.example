@@ -7,6 +7,7 @@
 #   X - Character Field
 #   Z - Zoned Decimal (Unpacked)
 #   P - Packed Decimal
+#   N - Integer
 #   * - (skip)
 #
 # <Field Length> is number of characters or number of digits - but not number
@@ -26,6 +27,7 @@ z:3
 z:12
 p:11
 p:11
+n:4 test1    # integer stored in 4 bytes
 *:5
     validate: not v.replace(' ', '')   # Validate the field just before
 p:11
